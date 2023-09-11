@@ -84,6 +84,8 @@ class GreedySearchDecoderOnlyOutput(ModelOutput):
     scores: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    prefill_elapsed: float = None
+    decoding_elapsed: float = None
 
 
 @dataclass
@@ -1669,8 +1671,16 @@ class GenerationMixin:
         cur_len = input_ids.shape[-1]
 
         this_peer_finished = False  # used by synced_gpus only
-        while True:
 
+        import time
+        prefill_phase = True
+        prefill_elapsed = 0
+        decoding_elapsed = 0
+        while True:
+            if prefill_phase is True:
+                torch.cuda.synchronize()
+                prefill_start = time.time()
+            
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
                 # The following logic allows an early break if all peers finished generating their sequence
@@ -1739,12 +1749,22 @@ class GenerationMixin:
             if eos_token_id is not None:
                 unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
 
+            if prefill_phase is True:
+                torch.cuda.synchronize()
+                prefill_end = time.time()
+                prefill_elapsed = (prefill_end - prefill_start) * 1000
+                prefill_phase = False
+
             # stop when each sentence is finished, or if we exceed the maximum length
             if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
                 if not synced_gpus:
                     break
                 else:
                     this_peer_finished = True
+
+            torch.cuda.synchronize()
+            decoding_end = time.time()
+            decoding_elapsed = (decoding_end - prefill_end) * 1000
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
@@ -1763,6 +1783,8 @@ class GenerationMixin:
                     scores=scores,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
+                    prefill_elapsed=prefill_elapsed,
+                    decoding_elapsed=decoding_elapsed
                 )
         else:
             return input_ids
